@@ -1,0 +1,48 @@
+{
+  "name": "pi-docker-sbx",
+  "version": "0.0.1",
+  "description": "A pi extension that delegates core tools to Docker Sandboxes via the sbx CLI. Every file read, write, shell command, and search runs in an isolated Docker microVM.",
+  "license": "MIT",
+  "author": "Fatih Karahan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fatih0234/pi-docker-sbx.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Fatih0234/pi-docker-sbx/issues"
+  },
+  "homepage": "https://github.com/Fatih0234/pi-docker-sbx#readme",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "files": [
+    "index.ts",
+    "README.md",
+    "sbx.example.json"
+  ],
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepublishOnly": "echo 'Ready to publish'"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "pi-extension",
+    "pi",
+    "docker",
+    "sandbox",
+    "sbx",
+    "isolated",
+    "security",
+    "microvm"
+  ]
+}

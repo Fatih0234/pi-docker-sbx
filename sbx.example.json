@@ -1,0 +1,14 @@
+{
+  "defaultSandbox": "my-project",
+  "agent": "shell",
+  "template": "docker.io/docker/sandbox-templates:shell-docker",
+  "branch": "auto",
+  "cpus": 4,
+  "memory": "8g",
+  "kits": [],
+  "ports": ["8080:3000"],
+  "env": {
+    "BRAVE_API_KEY": "$BRAVE_API_KEY"
+  },
+  "extraWorkspaces": []
+}
