@@ -55,6 +55,7 @@ interface SessionState {
 	capabilities?: SandboxCapabilities;
 	branch?: string;
 	error?: string;
+	worker?: WorkerState;
 }
 
 interface SbxConfig {
@@ -84,6 +85,16 @@ interface ExecResult {
 	code: number | null;
 	stdout: Buffer;
 	stderr: Buffer;
+}
+
+interface WorkerState {
+	child: ReturnType<typeof spawn>;
+	buffer: Buffer;
+	queue: Array<{
+		resolve: (result: ExecResult) => void;
+		reject: (error: Error) => void;
+	}>;
+	busy: boolean;
 }
 
 const PI_DOCKER_SBX_PREFIX = "pi-docker-sbx-";
@@ -297,6 +308,101 @@ printf '}\\n'
 	}
 }
 
+async function startWorker(state: SessionState): Promise<void> {
+	const script = 'tmp="/tmp/pi-docker-sbx-worker"; mkdir -p "$tmp"; printf \'WORKER_READY\\n\'; while true; do IFS= read -r header || break; [ "$header" = "EXIT" ] && break; [ -z "$header" ] && continue; id="\${header%%:*}"; len="\${header#*:}"; head -c "$len" > "$tmp/$id.sh"; bash "$tmp/$id.sh" > "$tmp/$id.out" 2> "$tmp/$id.err"; code=$?; olen=$(wc -c < "$tmp/$id.out"); elen=$(wc -c < "$tmp/$id.err"); printf \'%s\\n\' "$olen:$elen:$code"; cat "$tmp/$id.out"; cat "$tmp/$id.err"; rm -f "$tmp/$id.sh" "$tmp/$id.out" "$tmp/$id.err"; done; printf \'WORKER_EXIT\\n\'';
+	const child = spawn("sbx", ["exec", "-i", state.name, "bash", "-lc", script], { stdio: ["pipe", "pipe", "pipe"] });
+	let buffer = Buffer.alloc(0);
+	await new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("Worker startup timeout")), 30_000);
+		const onData = (chunk: Buffer) => {
+			buffer = Buffer.concat([buffer, chunk]);
+			const text = buffer.toString("utf8");
+			const idx = text.indexOf("WORKER_READY\n");
+			if (idx !== -1) {
+				clearTimeout(timeout);
+				child.stdout.off("data", onData);
+				buffer = buffer.slice(idx + Buffer.byteLength("WORKER_READY\n", "utf8"));
+				resolve();
+			}
+		};
+		child.stdout.on("data", onData);
+		child.on("error", (err) => { clearTimeout(timeout); reject(err); });
+		child.on("exit", (code) => { if (code !== null && code !== 0) { clearTimeout(timeout); reject(new Error(`Worker exited with code ${code}`)); } });
+	});
+	state.worker = { child, buffer, queue: [], busy: false };
+	child.stdout.on("data", (chunk: Buffer) => {
+		if (!state.worker) return;
+		state.worker.buffer = Buffer.concat([state.worker.buffer, chunk]);
+		drainWorker(state);
+	});
+	child.on("exit", () => {
+		if (!state.worker) return;
+		for (const pending of state.worker.queue) pending.reject(new Error("Worker process exited unexpectedly"));
+		state.worker.queue = [];
+		state.worker = undefined;
+	});
+	child.stderr.on("data", (chunk: Buffer) => {
+		const text = chunk.toString("utf8");
+		if (!/^Sandbox .* started successfully$/.test(text) && text !== "INFO: Starting Docker daemon\n") {
+			// unexpected worker stderr — could log but usually harmless startup noise
+		}
+	});
+}
+
+function stopWorker(state: SessionState): void {
+	if (!state.worker) return;
+	try { state.worker.child.stdin?.end("EXIT\n"); } catch { /* ignore */ }
+	setTimeout(() => {
+		try { state.worker?.child.kill("SIGKILL"); } catch { /* ignore */ }
+		state.worker = undefined;
+	}, 1000);
+}
+
+function drainWorker(state: SessionState): void {
+	const worker = state.worker;
+	if (!worker || worker.busy || worker.queue.length === 0) return;
+	worker.busy = true;
+	const pending = worker.queue[0];
+	const text = worker.buffer.toString("utf8");
+	const nl = text.indexOf("\n");
+	if (nl === -1) { worker.busy = false; return; }
+	const parts = text.slice(0, nl).split(":");
+	if (parts.length !== 3) {
+		worker.buffer = worker.buffer.slice(nl + 1);
+		worker.queue.shift();
+		worker.busy = false;
+		pending.reject(new Error(`Invalid worker response header: ${text.slice(0, nl)}`));
+		drainWorker(state);
+		return;
+	}
+	const [olen, elen, code] = parts.map((p) => parseInt(p, 10));
+	const total = nl + 1 + olen + elen;
+	if (worker.buffer.length < total) { worker.busy = false; return; }
+	const stdout = worker.buffer.slice(nl + 1, nl + 1 + olen);
+	const stderr = worker.buffer.slice(nl + 1 + olen, nl + 1 + olen + elen);
+	worker.buffer = worker.buffer.slice(total);
+	worker.queue.shift();
+	worker.busy = false;
+	pending.resolve({ code, stdout, stderr });
+	drainWorker(state);
+}
+
+async function sendWorkerCommand(state: SessionState, command: string): Promise<ExecResult> {
+	if (!state.worker) throw new Error("Worker not available");
+	const id = randomSuffix();
+	const cmdBuf = Buffer.from(command, "utf8");
+	const header = `${id}:${cmdBuf.length}\n`;
+	return new Promise<ExecResult>((resolve, reject) => {
+		state.worker!.queue.push({ resolve, reject });
+		try {
+			state.worker!.child.stdin!.write(Buffer.concat([Buffer.from(header, "utf8"), cmdBuf]));
+		} catch (error) {
+			reject(new Error(`Failed to send command to worker: ${messageOf(error)}`));
+		}
+		drainWorker(state);
+	});
+}
+
 function criticalCapabilityError(workspace: string, capabilities: SandboxCapabilities): string | undefined {
 	const missing: string[] = [];
 	if (!capabilities.workspaceExists) missing.push(`workspace does not exist or is not mounted: ${workspace}`);
@@ -444,26 +550,37 @@ function toSandboxPath(state: SessionState, path: string): string {
 
 
 async function readSandboxFile(state: SessionState, absolutePath: string): Promise<Buffer> {
-	const result = await sbx(["exec", state.name, "base64", "-w", "0", "--", toSandboxPath(state, absolutePath)], { timeoutMs: 120_000 });
+	const result = await sendWorkerCommand(state, `base64 -w 0 -- ${shQuote(toSandboxPath(state, absolutePath))}\n`);
+	if (result.code !== 0) {
+		const reason = result.stderr.toString("utf8").trim() || `read exited with code ${result.code}`;
+		throw new Error(reason);
+	}
 	return Buffer.from(result.stdout.toString("utf8"), "base64");
 }
 
 async function writeSandboxFile(state: SessionState, absolutePath: string, content: Buffer | string): Promise<void> {
 	const path = toSandboxPath(state, absolutePath);
-	const script = `mkdir -p -- ${shQuote(dirname(path))} && cat > ${shQuote(path)}`;
-	await sbx(["exec", "-i", state.name, "bash", "-lc", script], { input: content, timeoutMs: 120_000 });
+	const b64 = Buffer.from(content).toString("base64");
+	const script = `mkdir -p -- ${shQuote(dirname(path))} && echo ${shQuote(b64)} | base64 -d > ${shQuote(path)}`;
+	const result = await sendWorkerCommand(state, script + "\n");
+	if (result.code !== 0) {
+		const reason = result.stderr.toString("utf8").trim() || `write exited with code ${result.code}`;
+		throw new Error(reason);
+	}
 }
 
 function createSandboxReadOps(state: SessionState): ReadOperations {
 	return {
 		readFile: (absolutePath) => readSandboxFile(state, absolutePath),
 		access: async (absolutePath) => {
-			await sbx(["exec", state.name, "test", "-r", toSandboxPath(state, absolutePath)]);
+			const result = await sendWorkerCommand(state, `test -r ${shQuote(toSandboxPath(state, absolutePath))}\n`);
+			if (result.code !== 0) throw new Error(result.stderr.toString("utf8").trim() || "access denied");
 		},
 		detectImageMimeType: async (absolutePath) => {
 			if (state.capabilities && !state.capabilities.hasFile) return null;
 			try {
-				const result = await sbx(["exec", state.name, "file", "--mime-type", "-b", toSandboxPath(state, absolutePath)]);
+				const result = await sendWorkerCommand(state, `file --mime-type -b ${shQuote(toSandboxPath(state, absolutePath))}\n`);
+				if (result.code !== 0) return null;
 				const mime = result.stdout.toString("utf8").trim();
 				return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime) ? mime : null;
 			} catch {
@@ -477,7 +594,8 @@ function createSandboxWriteOps(state: SessionState): WriteOperations {
 	return {
 		writeFile: (absolutePath, content) => writeSandboxFile(state, absolutePath, content),
 		mkdir: async (dir) => {
-			await sbx(["exec", state.name, "mkdir", "-p", toSandboxPath(state, dir)]);
+			const result = await sendWorkerCommand(state, `mkdir -p ${shQuote(toSandboxPath(state, dir))}\n`);
+			if (result.code !== 0) throw new Error(result.stderr.toString("utf8").trim() || "mkdir failed");
 		},
 	};
 }
@@ -487,7 +605,8 @@ function createSandboxEditOps(state: SessionState): EditOperations {
 		readFile: (absolutePath) => readSandboxFile(state, absolutePath),
 		writeFile: (absolutePath, content) => writeSandboxFile(state, absolutePath, content),
 		access: async (absolutePath) => {
-			await sbx(["exec", state.name, "test", "-w", toSandboxPath(state, absolutePath)]);
+			const result = await sendWorkerCommand(state, `test -w ${shQuote(toSandboxPath(state, absolutePath))}\n`);
+			if (result.code !== 0) throw new Error(result.stderr.toString("utf8").trim() || "access denied");
 		},
 	};
 }
@@ -495,7 +614,7 @@ function createSandboxEditOps(state: SessionState): EditOperations {
 function createSandboxFindOps(state: SessionState): FindOperations {
 	return {
 		exists: async (absolutePath) => {
-			const result = await run("sbx", ["exec", state.name, "test", "-e", toSandboxPath(state, absolutePath)], { timeoutMs: 60_000 });
+			const result = await sendWorkerCommand(state, `test -e ${shQuote(toSandboxPath(state, absolutePath))}\n`);
 			return result.code === 0;
 		},
 		glob: async (pattern, cwd, options) => {
@@ -504,7 +623,7 @@ function createSandboxFindOps(state: SessionState): FindOperations {
 			const ignoreArgs = options.ignore.flatMap((glob) => ["--glob", `!${glob}`]);
 			if (state.capabilities?.hasRg ?? true) {
 				const args = ["rg", "--files", "--hidden", "--glob", pattern, ...ignoreArgs, "--", "."];
-				const result = await run("sbx", ["exec", "-w", searchPath, state.name, ...args], { timeoutMs: 60_000 });
+				const result = await sendWorkerCommand(state, `cd ${shQuote(searchPath)} && ${args.map(shQuote).join(" ")}\n`);
 				if (result.code !== 0 && result.code !== 1) {
 					const reason = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim() || `rg --files exited with code ${result.code}`;
 					throw new Error(reason);
@@ -612,7 +731,7 @@ function activeSandbox(ctx: ExtensionContext | undefined): SessionState | undefi
 }
 
 async function sandboxText(state: SessionState, script: string, cwd = state.cwd): Promise<string> {
-	const result = await sbx(["exec", "-w", toSandboxPath(state, cwd), state.name, "bash", "-lc", script], { timeoutMs: 60_000 });
+	const result = await sendWorkerCommand(state, `cd ${shQuote(toSandboxPath(state, cwd))} && ${script}\n`);
 	return [result.stdout, result.stderr].filter((b) => b.length > 0).map((b) => b.toString("utf8")).join("");
 }
 
@@ -666,7 +785,7 @@ async function benchmarkSandboxTransport(state: SessionState, iterations: number
 	const small = Buffer.from("pi-docker-sbx benchmark small file\n".repeat(8));
 	const large = Buffer.alloc(64 * 1024, "x");
 
-	await sbx(["exec", state.name, "mkdir", "-p", benchDir], { timeoutMs: 30_000 });
+	await sendWorkerCommand(state, `mkdir -p ${shQuote(benchDir)}\n`);
 	await writeSandboxFile(state, smallPath, small);
 	await writeSandboxFile(state, largePath, large);
 	await writeSandboxFile(state, editPath, "before\n");
@@ -993,13 +1112,12 @@ export default async function (pi: ExtensionAPI) {
 				args.push("--", params.pattern, searchPath);
 				searchCommand = args.map(shQuote).join(" ");
 			}
-			const script = `tmp="\${TMPDIR:-/tmp}/pi-docker-sbx-grep.$$"; trap 'rm -f "$tmp"' EXIT; ${searchCommand} >"$tmp"; status=$?; head -n ${shellLimit} "$tmp"; exit "$status"`;
-			const result = await run("sbx", ["exec", "-w", state.cwd, state.name, "bash", "-lc", script], { timeoutMs: 60_000 });
+			const result = await sendWorkerCommand(state, `cd ${shQuote(state.cwd)} && ${searchCommand}\n`);
 			if (result.code !== 0 && result.code !== 1) {
 				const reason = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim() || `grep exited with code ${result.code}`;
 				throw new Error(reason);
 			}
-			const lines = result.stdout.toString("utf8").split("\n").filter(Boolean).map((line) =>
+			const lines = result.stdout.toString("utf8").split("\n").filter(Boolean).slice(0, limit).map((line) =>
 				line.startsWith(state.cwd + "/") ? line.slice(state.cwd.length + 1) : line,
 			);
 			const matchLimitReached = lines.length > limit;
@@ -1029,7 +1147,7 @@ export default async function (pi: ExtensionAPI) {
 			const listPath = params.path ? toSandboxPath(state, params.path) : state.cwd;
 			const limit = Math.max(1, params.limit ?? 500);
 			const script = `dir=${shQuote(listPath)}; if [ ! -e "$dir" ]; then printf 'Path not found: %s\\n' "$dir" >&2; exit 2; fi; if [ ! -d "$dir" ]; then printf 'Not a directory: %s\\n' "$dir" >&2; exit 3; fi; ls -A1p -- "$dir" | sort -f`;
-			const result = await run("sbx", ["exec", state.name, "bash", "-lc", script], { timeoutMs: 60_000 });
+			const result = await sendWorkerCommand(state, script + "\n");
 			if (result.code !== 0) {
 				const reason = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim() || `ls exited with code ${result.code}`;
 				throw new Error(reason);
@@ -1122,6 +1240,7 @@ export default async function (pi: ExtensionAPI) {
 			}
 
 			sessions.set(sessionId, { name, hostCwd: ctx.cwd, cwd: ensured.workspace, enabled: true, capabilities, branch: createOptions.branch });
+			await startWorker(sessions.get(sessionId)!);
 
 			// Update status bar
 			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `🐳 Sandbox: ${name}${createOptions.branch ? ` | ${createOptions.branch}` : ""} | ${capabilitySummary(capabilities)}`));
@@ -1150,6 +1269,8 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		const state = sessions.get(ctx.sessionManager.getSessionId());
+		if (state) stopWorker(state);
 		sessions.delete(ctx.sessionManager.getSessionId());
 	});
 }
