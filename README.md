@@ -6,7 +6,7 @@ A persistent bash worker eliminates the per-call `sbx exec` overhead, dropping t
 
 ## Demo
 
-<video src="demo-display.mp4" controls></video>
+<video src="https://github.com/user-attachments/assets/139cf3b4-0f4a-4a4f-b818-c6affd19b766" controls></video>
 
 ## Why sandboxing?
 
