@@ -6,7 +6,7 @@ A persistent bash worker eliminates the per-call `sbx exec` overhead, dropping t
 
 ## Demo
 
-[![Demo](demo-preview.gif)](demo-display.mov)
+<video src="demo-display.mp4" controls></video>
 
 ## Why sandboxing?
 
