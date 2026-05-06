@@ -2,6 +2,12 @@
 
 Run pi safely inside a [Docker Sandbox](https://docker.com) via the `sbx` CLI. Every file read, write, shell command, and search runs in an isolated Docker microVM — your local machine is never touched.
 
+A persistent bash worker eliminates the per-call `sbx exec` overhead, dropping typical tool latency from **~8s to ~10ms** after the first connection.
+
+## Demo
+
+<video src="https://github.com/Fatih0234/pi-docker-sbx/releases/download/v1.0.0/demo-display.mov" controls></video>
+
 ## Why sandboxing?
 
 When pi edits files or runs bash commands, it operates directly on your machine. A sandbox moves all of that into a secure, disposable Docker environment. If the AI does something unexpected, your real filesystem stays safe. Think of it as a safety net — you can experiment freely and throw the sandbox away when you're done.
@@ -193,6 +199,12 @@ Non-critical capabilities like `rg`, `file`, `find`, and whether the workspace i
 | `--sandbox-workspaces` | string | Extra workspace paths (`:ro` for read-only) |
 | `--sandbox-ports` | string | Port mappings to publish (e.g., `8080:3000`) |
 | `--sandbox-env` | string | Environment variables (`KEY=VAL,...`) |
+
+## Performance
+
+`pi-docker-sbx` starts a persistent bash worker inside the sandbox on first connection. All non-streaming tools (`read`, `write`, `edit`, `grep`, `find`, `ls`) reuse this worker, avoiding the `~8–11s` Docker daemon startup cost on macOS for every call. Streaming `bash` commands still spawn fresh `sbx exec` processes so cancellation and real-time output work correctly.
+
+Run `/sbx-bench` inside a sandboxed pi session to measure transport overhead for your machine.
 
 ## Requirements
 
