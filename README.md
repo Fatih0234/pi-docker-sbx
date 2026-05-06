@@ -6,7 +6,7 @@ A persistent bash worker eliminates the per-call `sbx exec` overhead, dropping t
 
 ## Demo
 
-<video src="https://github.com/Fatih0234/pi-docker-sbx/releases/download/v1.0.0/demo-display.mov" controls></video>
+[![Demo](demo-preview.gif)](demo-display.mov)
 
 ## Why sandboxing?
 
